@@ -5,6 +5,7 @@ pipeline {
         NETLIFY_SITE_ID = '4e0a3f77-0ae3-4335-967c-a172cd5a0305'
         NETLIFY_AUTH_TOKEN = credentials('netlify-token')
         REACT_APP_VERSION = "1.0.$BUILD_ID"
+        APPSCAN_APP_ID = credentials('appscan-app-id')
     }
 
     stages {
@@ -88,14 +89,56 @@ pipeline {
             }
         }
 
-        stage('SAST - SonarQube') {
-            steps {
-                withSonarQubeEnv('SonarQube') {
-                    sh """
-                        ${tool 'sonar-scanner'}/bin/sonar-scanner \
-                            -Dsonar.analysis.buildNumber=${BUILD_NUMBER} \
-                            -Dsonar.links.ci=${BUILD_URL}
-                    """
+        stage('SAST') {
+            parallel {
+                stage('SonarQube') {
+                    steps {
+                        withSonarQubeEnv('SonarQube') {
+                            sh """
+                                ${tool 'sonar-scanner'}/bin/sonar-scanner \
+                                    -Dsonar.analysis.buildNumber=${BUILD_NUMBER} \
+                                    -Dsonar.links.ci=${BUILD_URL}
+                            """
+                        }
+                    }
+                }
+
+                stage('AppScan') {
+                    steps {
+                        withCredentials([usernamePassword(
+                            credentialsId: 'appscan-creds',
+                            usernameVariable: 'ASOC_KEY_ID',
+                            passwordVariable: 'ASOC_KEY_SECRET'
+                        )]) {
+                            script {
+                                appscan application: "${APPSCAN_APP_ID}",
+                                        credentials: 'appscan-creds',
+                                        name: 'learn-jenkins-app',
+                                        type: 'Static Analyzer',
+                                        scanner: staticAnalyzer(target: '.', hasOptions: false),
+                                        failBuild: false,
+                                        wait: true
+
+                                // AppScan plugin does not support buildUrl on SAST scans.
+                                // Post the build URL as a comment via ASoC REST API after scan completes.
+                                sh """
+                                    TOKEN=\$(curl -s -X POST https://cloud.appscan.com/api/v2/Account/ApiKeyLogin \
+                                        -H 'Content-Type: application/json' \
+                                        -d '{"KeyId":"'"\$ASOC_KEY_ID"'","KeySecret":"'"\$ASOC_KEY_SECRET"'"}' \
+                                        | grep -o '"Token":"[^"]*"' | cut -d'"' -f4)
+
+                                    SCAN_ID=\$(curl -s -X GET "https://cloud.appscan.com/api/v2/Scans?%24filter=Name+eq+'learn-jenkins-app'" \
+                                        -H "Authorization: Bearer \$TOKEN" \
+                                        | grep -o '"Id":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+                                    curl -s -X POST "https://cloud.appscan.com/api/v2/Scans/\$SCAN_ID/Comments" \
+                                        -H "Authorization: Bearer \$TOKEN" \
+                                        -H "Content-Type: application/json" \
+                                        -d '{"Comment":"Jenkins Build #${BUILD_NUMBER} | ${BUILD_URL}"}'
+                                """
+                            }
+                        }
+                    }
                 }
             }
         }
